@@ -1,0 +1,240 @@
+#!/usr/bin/env zsh
+# streak — tiny daily-habit streak tracker
+#   streak                 show today's checklist + streaks
+#   streak done <task>     mark task done today   (alias: did)
+#   streak undo <task>     unmark today
+#   streak add <task>      add a task to the checklist
+#   streak rm <task>       remove a task
+#   streak todo            print tasks not done today (one per line)
+#   streak -v [months]     full dashboard: heatmaps, graphs, stats (default 6 months)
+
+DIR=${STREAK_DIR:-$HOME/.streaks}
+TASKS=$DIR/tasks   # one task per line
+LOG=$DIR/log       # "YYYY-MM-DD task" per line
+[[ -f $TASKS && -f $LOG ]] || { mkdir -p $DIR; touch $TASKS $LOG }
+# Runs on every new tab, so nothing below starts another program per day checked: the log is
+# read once into a table, and dates are worked out with zsh's built-in strftime.
+zmodload zsh/datetime
+strftime -s today %F $EPOCHSECONDS
+typeset -A hit                    # hit["date/task"]=1 for every line of the log
+while read -r d t; do [[ -n $t ]] && hit[$d/$t]=1; done < $LOG
+
+# REPLY = the day before $1. From midnight back 12 h, so a 23 or 25 h daylight-saving day
+# can't skip or repeat a date.
+prev_day() { local e; strftime -r -s e %F $1; strftime -s REPLY %F $(( e - 43200 )) }
+did_on()   { (( ${+hit[$1/$2]} )) }
+
+streak_for() {  # REPLY = current streak of task $1
+  local task=$1 n=0 d=$today
+  # not done yet today? streak is still alive until midnight, count from yesterday
+  did_on $d $task || { prev_day $d; d=$REPLY }
+  while did_on $d $task; do (( n++ )); prev_day $d; d=$REPLY; done
+  REPLY=$n
+}
+
+week_for() {  # REPLY = last 7 days, oldest first
+  local task=$1 d=$today out=""
+  for i in {1..7}; do
+    if did_on $d $task; then out="■$out"; else out="·$out"; fi
+    prev_day $d; d=$REPLY
+  done
+  REPLY=$out
+}
+
+need_task() {
+  [[ -n $1 ]] || { echo "usage: streak $cmd <task>"; exit 1 }
+  grep -qxF "$1" $TASKS || { echo "unknown task '$1' (tasks: $(paste -sd' ' $TASKS))"; exit 1 }
+}
+
+# ---------- dashboard (streak -v) ----------
+C0=$'\e[0m' DIM=$'\e[2m' BOLD=$'\e[1m'
+HEAT=($'\e[38;5;237m' $'\e[38;5;22m' $'\e[38;5;28m' $'\e[38;5;34m' $'\e[38;5;46m')
+BARS=(' ' ▁ ▂ ▃ ▄ ▅ ▆ ▇ █) G=$'\e[38;5;34m'
+rep() { local i out=""; for (( i = 0; i < $2; i++ )); do out+=$1; done; print -rn -- $out }
+
+verbose() {
+  zmodload zsh/datetime
+  local months=${1:-6} d t e k i r c
+  local -a tasks=(${(f)"$(<$TASKS)"})
+  (( $#tasks )) || { echo "no tasks yet — try: streak add read"; return }
+  typeset -A first              # first[task]=first logged date (hit[] is filled at the top)
+  while read -r d t; do
+    [[ -n $t ]] || continue
+    [[ -z ${first[$t]} || $d < ${first[$t]} ]] && first[$t]=$d
+  done < $LOG
+
+  # day grid: whole weeks, Monday-first, ending with the current week
+  local noon=$(( $(strftime -r %F $today) + 43200 )) dow W=$(( months * 52 / 12 ))
+  strftime -s dow %u $noon
+  local start=$(( noon - ((dow - 1) + (W - 1) * 7) * 86400 ))
+  local -a D                     # D[k] = date of grid cell k (empty if future)
+  for (( k = 0; k < W * 7; k++ )); do
+    e=$(( start + k * 86400 ))
+    (( e <= noon )) && strftime -s d %F $e || d=""
+    D+=($d)
+  done
+
+  # per-day stats: done / active (task counts as active from its first log)
+  typeset -A ndone nactive
+  for d in ${D:#}; do
+    ndone[$d]=0 nactive[$d]=0
+    for t in $tasks; do
+      [[ -n ${first[$t]} && ! $d < ${first[$t]} ]] && (( nactive[$d]++ ))
+      [[ -n ${hit[$d/$t]} ]] && (( ndone[$d]++ ))
+    done
+  done
+
+  level() {  # level <date> [task] -> REPLY=0..4 (no subshell, called per cell)
+    local d=$1 t=$2
+    if [[ -n $t ]]; then [[ -n ${hit[$d/$t]} ]] && REPLY=4 || REPLY=0; return; fi
+    (( nactive[$d] && ndone[$d] )) || { REPLY=0; return }
+    REPLY=$(( (ndone[$d] * 4 + nactive[$d] - 1) / nactive[$d] ))   # ceil(frac*4)
+  }
+
+  heatmap() {  # heatmap [task]
+    local labels="" prev="" m col pos
+    for (( c = 0; c < W; c++ )); do
+      strftime -s m %b $(( start + c * 7 * 86400 ))
+      pos=$(( c * 2 ))
+      # skip a partial first month if the next column already starts a new one
+      if (( c == 0 )); then strftime -s prev %b $(( start + 7 * 86400 )); [[ $prev != $m ]] && { prev=$m; continue }; prev=""; fi
+      if [[ $m != $prev ]] && (( pos >= $#labels )); then
+        labels="${(r:pos:)labels}$m "
+      fi
+      prev=$m
+    done
+    echo "        ${DIM}${labels}${C0}"
+    local names=(Mon Tue Wed Thu Fri Sat Sun) row
+    for (( r = 0; r < 7; r++ )); do
+      row="    ${DIM}${names[r+1]}${C0} "
+      for (( c = 0; c < W; c++ )); do
+        d=${D[c*7+r+1]}
+        if [[ -z $d ]]; then row+="  "
+        elif [[ -n $1 && ( -z ${first[$1]} || $d < ${first[$1]} ) ]]; then row+="${DIM}·${C0} "
+        else level $d $1; row+="${HEAT[REPLY+1]}■${C0} "; fi
+      done
+      echo $row
+    done
+  }
+
+  pct_bar() {  # pct_bar <pct> <width>
+    local f=$(( $1 * $2 / 100 ))
+    print -rn -- "$G$(rep █ $f)$DIM$(rep ░ $(( $2 - f )))$C0"
+  }
+
+  # ---- header ----
+  local tot_done=0 tot_act=0 today_done=0 perfect=0
+  for d in ${(k)nactive}; do (( tot_done += ndone[$d], tot_act += nactive[$d] )); done
+  for t in $tasks; do [[ -n ${hit[$today/$t]} ]] && (( today_done++ )); done
+  e=$noon; strftime -s d %F $e
+  (( today_done == $#tasks )) || { (( e -= 86400 )); strftime -s d %F $e }
+  while (( ${nactive[$d]:-0} && ndone[$d] == nactive[$d] )); do
+    (( perfect++, e -= 86400 )); strftime -s d %F $e
+  done
+  local title; strftime -s title "%a %b %-d %Y" $noon
+  echo
+  echo "  ${BOLD}━━ streak dashboard · $title ━━${C0}"
+  echo "  today ${BOLD}$today_done/$#tasks${C0} done  ·  ${months}-month rate ${BOLD}$(( tot_act ? tot_done * 100 / tot_act : 0 ))%${C0}  ·  perfect-day streak ${BOLD}🔥 $perfect${C0}"
+
+  # ---- overall heatmap ----
+  echo; echo "  ${BOLD}OVERALL${C0} ${DIM}(share of tasks done each day)${C0}"
+  heatmap
+  local legend="        ${DIM}less${C0} "
+  for i in 1 2 3 4 5; do legend+="${HEAT[i]}■${C0} "; done
+  echo "$legend${DIM}more${C0}"
+
+  # ---- weekly % bar chart, columns aligned with heatmap ----
+  echo; echo "  ${BOLD}WEEKLY COMPLETION %${C0}"
+  local -a wk; local sd sa H=6 u fill row
+  for (( c = 0; c < W; c++ )); do
+    sd=0 sa=0
+    for (( r = 0; r < 7; r++ )); do
+      d=${D[c*7+r+1]}; [[ -n $d ]] && (( sd += ndone[$d], sa += nactive[$d] ))
+    done
+    wk+=($(( sa ? sd * 100 / sa : 0 )))
+  done
+  for (( r = H - 1; r >= 0; r-- )); do
+    case $r in $((H-1))) row="   ${DIM}100%${C0} " ;; $((H/2))) row="    ${DIM}50%${C0} " ;; 0) row="     ${DIM}0%${C0} " ;; *) row="        " ;; esac
+    for (( c = 1; c <= W; c++ )); do
+      u=$(( wk[c] * H * 8 / 100 )); fill=$(( u - r * 8 ))
+      (( fill < 0 )) && fill=0; (( fill > 8 )) && fill=8
+      row+="$G${BARS[fill+1]}${C0} "
+    done
+    echo $row
+  done
+  echo "        ${DIM}$(rep ‾ $(( W * 2 - 1 )))${C0}"
+  echo "        ${DIM}this week: ${wk[W]}%  ·  last week: ${wk[W-1]}%${C0}"
+
+  # ---- by weekday ----
+  echo; echo "  ${BOLD}BY WEEKDAY${C0} ${DIM}(last ${months} months)${C0}"
+  local -a wd_d wd_a; wd_d=(0 0 0 0 0 0 0) wd_a=(0 0 0 0 0 0 0)
+  for (( k = 1; k <= $#D; k++ )); do
+    d=${D[k]}; [[ -n $d ]] || continue
+    r=$(( (k - 1) % 7 + 1 ))
+    (( wd_d[r] += ndone[$d], wd_a[r] += nactive[$d] ))
+  done
+  local names=(Mon Tue Wed Thu Fri Sat Sun) p
+  for (( r = 1; r <= 7; r++ )); do
+    p=$(( wd_a[r] ? wd_d[r] * 100 / wd_a[r] : 0 ))
+    printf "    %s %s %3d%%\n" ${names[r]} "$(pct_bar $p 30)" $p
+  done
+
+  # ---- per task ----
+  local cur best run total r30 n30 s30 fd since
+  for t in $tasks; do
+    streak_for $t; cur=$REPLY best=0 run=0 total=0 r30=0
+    # walk every day since first log for longest streak + totals
+    if [[ -n ${first[$t]} ]]; then
+      e=$(( $(strftime -r %F ${first[$t]}) + 43200 ))
+      while (( e <= noon )); do
+        strftime -s d %F $e
+        if [[ -n ${hit[$d/$t]} ]]; then (( run++, total++ )); (( run > best )) && best=$run
+        else run=0; fi
+        (( e += 86400 ))
+      done
+      n30=0 s30=0
+      for (( i = 0; i < 30; i++ )); do
+        strftime -s d %F $(( noon - i * 86400 ))
+        [[ $d < ${first[$t]} ]] && break
+        (( n30++ )); [[ -n ${hit[$d/$t]} ]] && (( s30++ ))
+      done
+      r30=$(( n30 ? s30 * 100 / n30 : 0 ))
+      strftime -s since "%b %-d %Y" $(( $(strftime -r %F ${first[$t]}) + 43200 ))
+    else since="never"; fi
+    [[ -n ${hit[$today/$t]} ]] && fd="✅" || fd="⬜"
+    echo
+    echo "  $fd ${BOLD}${(U)t}${C0}   🔥 ${BOLD}$cur${C0} now  ·  🏆 $best best  ·  $total total  ·  since $since"
+    echo "    ${DIM}last 30d${C0} $(pct_bar $r30 30) $r30%"
+    heatmap $t
+  done
+  echo
+}
+
+cmd=${1:-show}
+case $cmd in
+  show)
+    [[ -s $TASKS ]] || { echo "no tasks yet — try: streak add read"; exit }
+    while read -r t; do
+      streak_for $t; n=$REPLY
+      did_on $today $t && box="✅" || box="⬜"
+      (( n > 0 )) && fire="🔥 $n" || fire="   0"
+      week_for $t
+      printf "  %s %-12s %s  %s\n" $box $t "$REPLY" "$fire"
+    done < $TASKS ;;
+  done|did)
+    need_task $2
+    did_on $today $2 || { echo "$today $2" >> $LOG; hit[$today/$2]=1 }
+    streak_for $2
+    echo "✅ $2 — streak: $REPLY 🔥 \n"
+    echo "Updated Streak:"
+    "$0" ;;
+  undo)
+    need_task $2
+    grep -vxF "$today $2" $LOG > $LOG.tmp; mv $LOG.tmp $LOG
+    echo "undid $2 for today" ;;
+  add)  [[ -n $2 ]] && { grep -qxF "$2" $TASKS || echo $2 >> $TASKS; echo "added $2" } ;;
+  rm)   need_task $2; grep -vxF "$2" $TASKS > $TASKS.tmp; mv $TASKS.tmp $TASKS; echo "removed $2" ;;
+  -v|--verbose|stats) verbose $2 ;;
+  todo) while read -r t; do did_on $today $t || echo $t; done < $TASKS ;;
+  *)    sed -n '2,10p' $0 | sed 's/^# //' ;;
+esac
